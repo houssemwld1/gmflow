@@ -9,7 +9,175 @@ import os
 from glob import glob
 from PIL import Image
 from gmflow.gmflow.utils import frame_utils
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
+class GMFlowEstimator(nn.Module):
+    def __init__(self, 
+                 feature_channels=128,
+                 num_scales=1,
+                 upsample_factor=8,
+                 num_head=1,
+                 attention_type='swin',
+                 ffn_dim_expansion=4,
+                 num_transformer_layers=6,
+                 attn_splits_list=[2],
+                 corr_radius_list=[-1],
+                 prop_radius_list=[-1],
+                 pred_bidir_flow=False,
+                 fwd_bwd_consistency_check=False,
+                 padding_factor=16,
+                 inference_size=None,
+                 resume=None,
+                 device='cuda'):
+        """
+        GMFlow Estimator for optical flow computation in DVC pipeline.
+        
+        Args:
+            feature_channels (int): Number of feature channels in GMFlow.
+            num_scales (int): Number of scales for multi-scale processing.
+            upsample_factor (int): Upsampling factor for flow prediction.
+            num_head (int): Number of attention heads in transformers.
+            attention_type (str): Type of attention mechanism ('swin' or others).
+            ffn_dim_expansion (int): Expansion factor for feed-forward network.
+            num_transformer_layers (int): Number of transformer layers.
+            attn_splits_list (list): Number of splits in attention.
+            corr_radius_list (list): Correlation radius for matching (-1 for global).
+            prop_radius_list (list): Self-attention radius for flow propagation (-1 for global).
+            pred_bidir_flow (bool): Predict bidirectional flow if True.
+            fwd_bwd_consistency_check (bool): Perform forward-backward consistency check.
+            padding_factor (int): Padding factor for input dimensions.
+            inference_size (tuple): Optional inference size [H, W] for resizing.
+            resume (str): Path to pretrained GMFlow checkpoint.
+            device (str): Device to run the model on ('cuda' or 'cpu').
+        """
+        super(GMFlowEstimator, self).__init__()
+        
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        logger.info(f"Initializing GMFlowEstimator on device: {self.device}")
+
+        # Initialize GMFlow model
+        self.model = GMFlow(
+            feature_channels=feature_channels,
+            num_scales=num_scales,
+            upsample_factor=upsample_factor,
+            num_head=num_head,
+            attention_type=attention_type,
+            ffn_dim_expansion=ffn_dim_expansion,
+            num_transformer_layers=num_transformer_layers
+        ).to(self.device)
+
+        # Load pretrained weights
+        if resume:
+            try:
+                logger.info(f'Loading GMFlow checkpoint: {resume}')
+                checkpoint = torch.load(resume, map_location=self.device)
+                self.model.load_state_dict(checkpoint['model'] if 'model' in checkpoint else checkpoint)
+            except Exception as e:
+                logger.error(f"Failed to load checkpoint: {e}")
+                raise
+
+        # Inference settings
+        self.attn_splits_list = attn_splits_list
+        self.corr_radius_list = corr_radius_list
+        self.prop_radius_list = prop_radius_list
+        self.pred_bidir_flow = pred_bidir_flow
+        self.fwd_bwd_consistency_check = fwd_bwd_consistency_check
+        self.padding_factor = padding_factor
+        self.inference_size = inference_size
+
+        # Validate settings
+        if self.fwd_bwd_consistency_check and not self.pred_bidir_flow:
+            logger.error("Forward-backward consistency check requires pred_bidir_flow=True")
+            raise ValueError("Forward-backward consistency check requires pred_bidir_flow=True")
+
+        # Set model to evaluation mode
+        self.model.eval()
+        logger.info("GMFlowEstimator initialized successfully")
+
+    def forward(self, image1, image2):
+        """
+        Compute optical flow between image1 and image2, following the logic from inference_on_dir.
+        
+        Args:
+            image1 (torch.Tensor): First frame, shape [B, 3, H, W], values in [0, 1]
+            image2 (torch.Tensor): Second frame, shape [B, 3, H, W], values in [0, 1]
+        
+        Returns:
+            If pred_bidir_flow=False: torch.Tensor, optical flow [B, 2, H, W]
+            If pred_bidir_flow=True: tuple of (flow_forward, flow_backward), each [B, 2, H, W]
+        """
+        # Validate input shapes
+        if image1.shape != image2.shape:
+            logger.error(f"Input shapes do not match: image1 {image1.shape}, image2 {image2.shape}")
+            raise ValueError("Input shapes must match")
+        if image1.shape[1] != 3:
+            logger.error(f"Expected 3 channels, got {image1.shape[1]}")
+            raise ValueError("Input images must have 3 channels")
+
+        # Move inputs to device
+        image1 = image1.to(self.device)
+        image2 = image2.to(self.device)
+
+        # Convert to uint8 range [0, 255] as in inference_on_dir
+        image1 = (image1 * 255).clamp(0, 255).to(torch.uint8).float()
+        image2 = (image2 * 255).clamp(0, 255).to(torch.uint8).float()
+
+        # Padding
+        if self.inference_size is None:
+            padder = InputPadder(image1.shape, padding_factor=self.padding_factor)
+            image1, image2 = padder.pad(image1, image2)
+        else:
+            image1, image2 = image1, image2
+
+        # Resize if inference_size is specified
+        if self.inference_size is not None:
+            if not isinstance(self.inference_size, (list, tuple)):
+                logger.error(f"inference_size must be a list or tuple, got {type(self.inference_size)}")
+                raise ValueError("inference_size must be a list or tuple")
+            ori_size = image1.shape[-2:]
+            image1 = F.interpolate(image1, size=self.inference_size, mode='bilinear', align_corners=True)
+            image2 = F.interpolate(image2, size=self.inference_size, mode='bilinear', align_corners=True)
+
+        # Compute optical flow
+        with torch.no_grad():
+            results_dict = self.model(
+                image1,
+                image2,
+                attn_splits_list=self.attn_splits_list,
+                corr_radius_list=self.corr_radius_list,
+                prop_radius_list=self.prop_radius_list,
+                pred_bidir_flow=self.pred_bidir_flow
+            )
+            flow_pr = results_dict['flow_preds'][-1]  # [B, 2, H, W] or [2, B, 2, H, W] if pred_bidir_flow=True
+
+        # Resize back if inference_size was used
+        if self.inference_size is not None:
+            flow_pr = F.interpolate(flow_pr, size=ori_size, mode='bilinear', align_corners=True)
+            flow_pr[:, 0] = flow_pr[:, 0] * ori_size[-1] / self.inference_size[-1]
+            flow_pr[:, 1] = flow_pr[:, 1] * ori_size[-2] / self.inference_size[-2]
+
+        # Unpad if padding was applied
+        if self.inference_size is None:
+            flow_pr = padder.unpad(flow_pr)
+
+        # Handle bidirectional flow
+        if self.pred_bidir_flow:
+            flow_forward = flow_pr[0]  # [B, 2, H, W]
+            flow_backward = flow_pr[1]  # [B, 2, H, W]
+
+            # Forward-backward consistency check
+            if self.fwd_bwd_consistency_check:
+                fwd_occ, bwd_occ = forward_backward_consistency_check(flow_forward.unsqueeze(0), flow_backward.unsqueeze(0))
+                # Optionally, use fwd_occ and bwd_occ to mask unreliable flow regions
+                # For simplicity, return the flows as-is
+
+            logger.info(f"Computed bidirectional flow: forward {flow_forward.shape}, backward {flow_backward.shape}")
+            return flow_forward, flow_backward
+        else:
+            logger.info(f"Computed unidirectional flow: {flow_pr.shape}")
+            return flow_pr  # [B, 2, H, W]
 # class GMFlowEstimator(nn.Module):
 #     def __init__(self, 
 #                  feature_channels=128,
@@ -243,172 +411,3 @@ from gmflow.gmflow.utils import frame_utils
 #         Image.fromarray(flow_img).save(output_file)
 
 # Set up logging
-import logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-class GMFlowEstimator(nn.Module):
-    def __init__(self, 
-                 feature_channels=128,
-                 num_scales=1,
-                 upsample_factor=8,
-                 num_head=1,
-                 attention_type='swin',
-                 ffn_dim_expansion=4,
-                 num_transformer_layers=6,
-                 attn_splits_list=[2],
-                 corr_radius_list=[-1],
-                 prop_radius_list=[-1],
-                 pred_bidir_flow=False,
-                 fwd_bwd_consistency_check=False,
-                 padding_factor=16,
-                 inference_size=None,
-                 resume=None,
-                 device='cuda'):
-        """
-        GMFlow Estimator for optical flow computation in DVC pipeline.
-        
-        Args:
-            feature_channels (int): Number of feature channels in GMFlow.
-            num_scales (int): Number of scales for multi-scale processing.
-            upsample_factor (int): Upsampling factor for flow prediction.
-            num_head (int): Number of attention heads in transformers.
-            attention_type (str): Type of attention mechanism ('swin' or others).
-            ffn_dim_expansion (int): Expansion factor for feed-forward network.
-            num_transformer_layers (int): Number of transformer layers.
-            attn_splits_list (list): Number of splits in attention.
-            corr_radius_list (list): Correlation radius for matching (-1 for global).
-            prop_radius_list (list): Self-attention radius for flow propagation (-1 for global).
-            pred_bidir_flow (bool): Predict bidirectional flow if True.
-            fwd_bwd_consistency_check (bool): Perform forward-backward consistency check.
-            padding_factor (int): Padding factor for input dimensions.
-            inference_size (tuple): Optional inference size [H, W] for resizing.
-            resume (str): Path to pretrained GMFlow checkpoint.
-            device (str): Device to run the model on ('cuda' or 'cpu').
-        """
-        super(GMFlowEstimator, self).__init__()
-        
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        logger.info(f"Initializing GMFlowEstimator on device: {self.device}")
-
-        # Initialize GMFlow model
-        self.model = GMFlow(
-            feature_channels=feature_channels,
-            num_scales=num_scales,
-            upsample_factor=upsample_factor,
-            num_head=num_head,
-            attention_type=attention_type,
-            ffn_dim_expansion=ffn_dim_expansion,
-            num_transformer_layers=num_transformer_layers
-        ).to(self.device)
-
-        # Load pretrained weights
-        if resume:
-            try:
-                logger.info(f'Loading GMFlow checkpoint: {resume}')
-                checkpoint = torch.load(resume, map_location=self.device)
-                self.model.load_state_dict(checkpoint['model'] if 'model' in checkpoint else checkpoint)
-            except Exception as e:
-                logger.error(f"Failed to load checkpoint: {e}")
-                raise
-
-        # Inference settings
-        self.attn_splits_list = attn_splits_list
-        self.corr_radius_list = corr_radius_list
-        self.prop_radius_list = prop_radius_list
-        self.pred_bidir_flow = pred_bidir_flow
-        self.fwd_bwd_consistency_check = fwd_bwd_consistency_check
-        self.padding_factor = padding_factor
-        self.inference_size = inference_size
-
-        # Validate settings
-        if self.fwd_bwd_consistency_check and not self.pred_bidir_flow:
-            logger.error("Forward-backward consistency check requires pred_bidir_flow=True")
-            raise ValueError("Forward-backward consistency check requires pred_bidir_flow=True")
-
-        # Set model to evaluation mode
-        self.model.eval()
-        logger.info("GMFlowEstimator initialized successfully")
-
-    def forward(self, image1, image2):
-        """
-        Compute optical flow between image1 and image2, following the logic from inference_on_dir.
-        
-        Args:
-            image1 (torch.Tensor): First frame, shape [B, 3, H, W], values in [0, 1]
-            image2 (torch.Tensor): Second frame, shape [B, 3, H, W], values in [0, 1]
-        
-        Returns:
-            If pred_bidir_flow=False: torch.Tensor, optical flow [B, 2, H, W]
-            If pred_bidir_flow=True: tuple of (flow_forward, flow_backward), each [B, 2, H, W]
-        """
-        # Validate input shapes
-        if image1.shape != image2.shape:
-            logger.error(f"Input shapes do not match: image1 {image1.shape}, image2 {image2.shape}")
-            raise ValueError("Input shapes must match")
-        if image1.shape[1] != 3:
-            logger.error(f"Expected 3 channels, got {image1.shape[1]}")
-            raise ValueError("Input images must have 3 channels")
-
-        # Move inputs to device
-        image1 = image1.to(self.device)
-        image2 = image2.to(self.device)
-
-        # Convert to uint8 range [0, 255] as in inference_on_dir
-        image1 = (image1 * 255).clamp(0, 255).to(torch.uint8).float()
-        image2 = (image2 * 255).clamp(0, 255).to(torch.uint8).float()
-
-        # Padding
-        if self.inference_size is None:
-            padder = InputPadder(image1.shape, padding_factor=self.padding_factor)
-            image1, image2 = padder.pad(image1, image2)
-        else:
-            image1, image2 = image1, image2
-
-        # Resize if inference_size is specified
-        if self.inference_size is not None:
-            if not isinstance(self.inference_size, (list, tuple)):
-                logger.error(f"inference_size must be a list or tuple, got {type(self.inference_size)}")
-                raise ValueError("inference_size must be a list or tuple")
-            ori_size = image1.shape[-2:]
-            image1 = F.interpolate(image1, size=self.inference_size, mode='bilinear', align_corners=True)
-            image2 = F.interpolate(image2, size=self.inference_size, mode='bilinear', align_corners=True)
-
-        # Compute optical flow
-        with torch.no_grad():
-            results_dict = self.model(
-                image1,
-                image2,
-                attn_splits_list=self.attn_splits_list,
-                corr_radius_list=self.corr_radius_list,
-                prop_radius_list=self.prop_radius_list,
-                pred_bidir_flow=self.pred_bidir_flow
-            )
-            flow_pr = results_dict['flow_preds'][-1]  # [B, 2, H, W] or [2, B, 2, H, W] if pred_bidir_flow=True
-
-        # Resize back if inference_size was used
-        if self.inference_size is not None:
-            flow_pr = F.interpolate(flow_pr, size=ori_size, mode='bilinear', align_corners=True)
-            flow_pr[:, 0] = flow_pr[:, 0] * ori_size[-1] / self.inference_size[-1]
-            flow_pr[:, 1] = flow_pr[:, 1] * ori_size[-2] / self.inference_size[-2]
-
-        # Unpad if padding was applied
-        if self.inference_size is None:
-            flow_pr = padder.unpad(flow_pr)
-
-        # Handle bidirectional flow
-        if self.pred_bidir_flow:
-            flow_forward = flow_pr[0]  # [B, 2, H, W]
-            flow_backward = flow_pr[1]  # [B, 2, H, W]
-
-            # Forward-backward consistency check
-            if self.fwd_bwd_consistency_check:
-                fwd_occ, bwd_occ = forward_backward_consistency_check(flow_forward.unsqueeze(0), flow_backward.unsqueeze(0))
-                # Optionally, use fwd_occ and bwd_occ to mask unreliable flow regions
-                # For simplicity, return the flows as-is
-
-            logger.info(f"Computed bidirectional flow: forward {flow_forward.shape}, backward {flow_backward.shape}")
-            return flow_forward, flow_backward
-        else:
-            logger.info(f"Computed unidirectional flow: {flow_pr.shape}")
-            return flow_pr  # [B, 2, H, W]

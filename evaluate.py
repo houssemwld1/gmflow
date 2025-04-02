@@ -687,3 +687,5 @@ def inference_on_dir(model,
         if save_flo_flow:
             output_file = os.path.join(output_path, os.path.basename(filenames[test_id])[:-4] + '_pred.flo')
             frame_utils.writeFlow(output_file, flow)
+            
+        return flow, output_file  # Return the flow and the output file path for further processing

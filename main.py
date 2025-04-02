@@ -97,10 +97,8 @@ def main(args):
                                          fwd_bwd_consistency_check=args.fwd_bwd_consistency_check)
 
     # Save flow as images if required
-    if args.save_image_flow:
-        for idx, (flow, flow_path) in enumerate(inference_results):
-            image_output_path = os.path.join(args.output_path, f"flow_{idx:04d}.png")
-            save_flow_as_image(flow, image_output_path)
+
+
 
 
 if __name__ == '__main__':

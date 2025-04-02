@@ -68,7 +68,7 @@ class GMFlowEstimator(nn.Module):
 
     def forward(self, img1, img2):
         """
-        Compute optical flow between img1 and img2.
+        Compoptical flow between img1 and img2.
         Args:
             img1 (torch.Tensor): First frame, shape [B, 3, H, W], values in [0, 1]
             img2 (torch.Tensor): Second frame, shape [B, 3, H, W], values in [0, 1]

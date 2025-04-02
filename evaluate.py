@@ -650,6 +650,7 @@ def inference_on_dir(model,
         output_file = os.path.join(output_path, os.path.basename(filenames[test_id])[:-4] + '_flow.png')
 
         # save vis flow
+        print('Saving %s:',flow )
         save_vis_flow_tofile(flow, output_file)
 
         # also predict backward flow

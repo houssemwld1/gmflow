@@ -24,7 +24,7 @@ class GMFlowEstimator(nn.Module):
                  prop_radius_list=[-1],
                  pred_bidir_flow=False,
                  fwd_bwd_consistency_check=False,
-                 padding_factor=8,
+                 padding_factor=16,
                  inference_size=None,
                  resume=None,
                  device='cuda'):
@@ -84,8 +84,9 @@ class GMFlowEstimator(nn.Module):
         img2 = img2.to(self.device)
 
         # Normalize inputs
-        img1_norm = self.normalize_for_gmflow(img1)
+        img1_norm =self.normalize_for_gmflow(img1)
         img2_norm = self.normalize_for_gmflow(img2)
+
 
         # Padding
         if self.inference_size is None:
@@ -136,6 +137,7 @@ class GMFlowEstimator(nn.Module):
 
             return flow_forward, flow_backward
         else:
+            # print('Saving %s:',flow_pr )
             return flow_pr  # [B, 2, H, W]
 
     def inference_on_dir(self, inference_dir, output_path='output', paired_data=False, save_flo_flow=False):

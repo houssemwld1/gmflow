@@ -5,6 +5,7 @@ from PIL import Image
 import numpy as np
 import os 
 from gmflow.gmflow.utils.flow_viz import save_vis_flow_tofile
+
 class TestGMFlowEstimator(unittest.TestCase):
     def setUp(self):
         # Set up a GMFlowEstimator instance with default parameters
